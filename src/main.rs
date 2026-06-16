@@ -21,6 +21,12 @@ struct Args {
     #[arg(long, default_value = "")]
     config: String,
     #[arg(long, default_value = "")]
+    expert_dir: String,
+    #[arg(long, default_value_t = false)]
+    run: bool,
+    #[arg(long, default_value_t = 9707)]
+    token: u32,
+    #[arg(long, default_value = "")]
     prompt: String,
     #[arg(long, default_value_t = 50)]
     max_tokens: usize,
@@ -51,15 +57,26 @@ fn main() {
         }
     }
 
-    if !args.config.is_empty() {
-        match model::Qwen3MoeConfig::from_file(std::path::Path::new(&args.config)) {
-            Ok(c) => println!(
-                "[obsidian] config: {} layers, hidden {}, {} experts top-{}, \
-                 head_dim {}, rope_theta {}, vocab {}",
-                c.num_hidden_layers, c.hidden_size, c.num_experts,
-                c.num_experts_per_tok, c.head_dim(), c.rope_theta, c.vocab_size
-            ),
-            Err(e) => eprintln!("[obsidian] config parse failed: {e}"),
+    if args.run {
+        let exec = match executor::ObsidianExecutor::new() {
+            Ok(e) => e, Err(e) => { eprintln!("[obsidian] executor: {e}"); std::process::exit(1); }
+        };
+        let model_dir = std::path::Path::new(&args.config).parent()
+            .expect("--config must point at config.json").to_path_buf();
+        let expert_dir = if args.expert_dir.is_empty() {
+            model_dir.join("splitted_moe")
+        } else { std::path::PathBuf::from(&args.expert_dir) };
+        println!("[obsidian] loading model from {} ...", model_dir.display());
+        let t0 = std::time::Instant::now();
+        let mut m = match forward::Model::new(&model_dir, &expert_dir, &exec) {
+            Ok(m) => m, Err(e) => { eprintln!("[obsidian] model load FAILED: {e}"); std::process::exit(1); }
+        };
+        println!("[obsidian] loaded in {:.1}s; running 1 token (input id {}) ...",
+                 t0.elapsed().as_secs_f32(), args.token);
+        let t1 = std::time::Instant::now();
+        match m.run_one_token(&exec, args.token) {
+            Ok(tok) => println!("[obsidian] next token id = {} ({:.1}s)", tok, t1.elapsed().as_secs_f32()),
+            Err(e) => { eprintln!("[obsidian] forward FAILED: {e}"); std::process::exit(1); }
         }
     }
 }

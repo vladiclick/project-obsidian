@@ -12,7 +12,7 @@ struct RopeParams { n_heads: u32, head_dim: u32, pos: u32, theta: f32 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct SdpaParams { n_heads: u32, n_kv: u32, head_dim: u32, seq_len: u32, scale: f32 }
+struct SdpaParams { n_heads: u32, n_kv: u32, head_dim: u32, seq_len: u32, kv_stride: u32, scale: f32 }
 
 pub struct Attention {
     pub n_heads: u32,
@@ -43,6 +43,7 @@ impl Attention {
         let sp = SdpaParams {
             n_heads: self.n_heads, n_kv: self.n_kv, head_dim: self.head_dim,
             seq_len: kv.seq_len.max(1) as u32,
+            kv_stride: kv.max_len as u32,
             scale: (self.head_dim as f32).powf(-0.5),
         };
         let pso = exec.pipeline("sdpa_decode").ok_or("sdpa_decode missing")?;

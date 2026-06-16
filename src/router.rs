@@ -23,7 +23,7 @@ pub struct MoeRouter {
 impl MoeRouter {
     /// Dispatch moe_routing_topk on `gate_logits` ([n_experts] fp16), read back
     /// the top-k expert ids. (weights buffer also produced, kept on GPU.)
-    pub fn route(&self, exec: &ObsidianExecutor, gate_logits: &Buffer) -> Result<Vec<u32>, String> {
+    pub fn route(&self, exec: &ObsidianExecutor, gate_logits: &Buffer) -> Result<(Vec<u32>, Vec<f32>), String> {
         let dev = exec.device();
         let k = self.top_k as u64;
         let idx_buf = dev.new_buffer(k * 4, MTLResourceOptions::StorageModeShared);
@@ -48,11 +48,12 @@ impl MoeRouter {
         cb.commit();
         cb.wait_until_completed();
 
-        let ptr = idx_buf.contents() as *const i32;
-        let ids: Vec<u32> = (0..self.top_k as isize)
-            .map(|i| unsafe { *ptr.offset(i) } as u32)
-            .collect();
-        Ok(ids)
+        let ip = idx_buf.contents() as *const i32;
+        let wp = w_buf.contents() as *const u16;
+        let ids: Vec<u32> = (0..self.top_k as isize).map(|i| unsafe { *ip.offset(i) } as u32).collect();
+        let wts: Vec<f32> = (0..self.top_k as isize)
+            .map(|i| half::f16::from_bits(unsafe { *wp.offset(i) }).to_f32()).collect();
+        Ok((ids, wts))
     }
 
     /// Full step: route, then page the selected experts off disk.
@@ -63,7 +64,7 @@ impl MoeRouter {
         index: &ExpertIndex,
         layer: usize,
     ) -> Result<Vec<RawTensor>, String> {
-        let ids = self.route(exec, gate_logits)?;
+        let (ids, _wts) = self.route(exec, gate_logits)?;
         Ok(read_experts_parallel(index, layer, &ids))
     }
 }

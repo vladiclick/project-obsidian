@@ -5,7 +5,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-struct SdpaParams { uint n_heads; uint n_kv; uint head_dim; uint seq_len; float scale; };
+struct SdpaParams { uint n_heads; uint n_kv; uint head_dim; uint seq_len; uint kv_stride; float scale; };
 
 kernel void sdpa_decode(
     device const half*   q   [[buffer(0)]],   // [n_heads, head_dim]
@@ -23,7 +23,7 @@ kernel void sdpa_decode(
         float dot = 0.0f;
         for (uint d = 0; d < p.head_dim; d++)
             dot += (float)q[h * p.head_dim + d]
-                 * (float)k[(kv * p.seq_len + t) * p.head_dim + d];
+                 * (float)k[(kv * p.kv_stride + t) * p.head_dim + d];
         scores[t] = dot * p.scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -36,7 +36,7 @@ kernel void sdpa_decode(
         for (uint d = 0; d < p.head_dim; d++) {
             float acc = 0.0f;
             for (uint t = 0; t < p.seq_len; t++)
-                acc += scores[t] * (float)v[(kv * p.seq_len + t) * p.head_dim + d];
+                acc += scores[t] * (float)v[(kv * p.kv_stride + t) * p.head_dim + d];
             out[h * p.head_dim + d] = (half)(acc / sum);
         }
     }

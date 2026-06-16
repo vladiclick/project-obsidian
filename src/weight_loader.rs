@@ -43,7 +43,23 @@ impl Weights {
                 if name.contains("switch_mlp") { continue; } // experts: streamed
                 let view = st.tensor(name)
                     .map_err(|e| ObsidianError::Parse(e.to_string()))?;
-                let data = view.data();
+                let raw = view.data();
+                // Kernels expect f16. mlx repos store scales/biases/norms as BF16
+                // -> convert bf16->f16 here. Packed 4-bit weights (U32/I32) and
+                // already-f16 tensors are copied as-is.
+                let owned: Vec<u8>;
+                let data: &[u8] = match view.dtype() {
+                    safetensors::Dtype::BF16 => {
+                        let v: Vec<u8> = raw.chunks_exact(2).flat_map(|c| {
+                            let bf = u16::from_le_bytes([c[0], c[1]]);
+                            let f = half::bf16::from_bits(bf).to_f32();
+                            half::f16::from_f32(f).to_bits().to_le_bytes()
+                        }).collect();
+                        owned = v;
+                        &owned
+                    }
+                    _ => raw,
+                };
                 let buf = dev.new_buffer(data.len() as u64, opt);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
