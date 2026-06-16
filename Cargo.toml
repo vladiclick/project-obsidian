@@ -1,0 +1,50 @@
+[package]
+name = "obsidian"
+version = "0.1.0"
+# edition 2024 needs rustc >= 1.85; we have 1.96, but 2021 is fine and portable.
+edition = "2021"
+
+[dependencies]
+# Raw Metal bindings (gfx-rs/metal-rs). Real, resolved by cargo. This is the
+# foundation: device, runtime MSL compilation, custom-kernel dispatch.
+metal = "0.29"
+
+# safetensors header parsing + mmap tensor access (real, resolved)
+safetensors = "0.4"
+memmap2 = "0.9"
+
+# Parallel pread() for expert streaming
+rayon = "1.10"
+
+# Numeric types
+half = { version = "2", features = ["num-traits", "std"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# FFI for macOS pread/mlock
+libc = "0.2"
+
+# CLI + logging
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+
+# mlx-rs (official MLX Rust binding, real: v0.25.3). OPTIONAL: building it
+# compiles the MLX C++ backend, which requires `cmake` (currently MISSING).
+# Enable with `--features mlx` after `brew install cmake`. The metal-rs
+# foundation compiles WITHOUT it.
+mlx-rs = { version = "0.25.3", optional = true }
+
+[features]
+default = []
+mlx = ["dep:mlx-rs"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
