@@ -8,6 +8,8 @@ mod model;
 mod router;
 mod kv_cache;
 mod attention;
+mod weight_loader;
+mod forward;
 
 use clap::Parser;
 
