@@ -8,7 +8,7 @@
 use metal::{CompileOptions, ComputePipelineState, Device, Library};
 use std::collections::HashMap;
 
-const SHADERS: [(&str, &str); 4] = [
+const SHADERS: [(&str, &str); 6] = [
     ("fused_dequant_matvec_4bit",
         include_str!("../shaders/fused_dequant_matvec_4bit.metal")),
     ("moe_routing_topk",
@@ -17,6 +17,10 @@ const SHADERS: [(&str, &str); 4] = [
         include_str!("../shaders/fused_moe_combine.metal")),
     ("fused_residual_rms_norm",
         include_str!("../shaders/fused_residual_rms_norm.metal")),
+    ("rope_apply",
+        include_str!("../shaders/rope.metal")),
+    ("sdpa_decode",
+        include_str!("../shaders/sdpa_decode.metal")),
 ];
 
 pub struct ObsidianExecutor {
