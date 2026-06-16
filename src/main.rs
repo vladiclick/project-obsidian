@@ -6,6 +6,8 @@ mod executor;
 mod disk_io;
 mod model;
 mod router;
+mod kv_cache;
+mod attention;
 
 use clap::Parser;
 
