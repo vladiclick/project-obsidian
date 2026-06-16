@@ -4,6 +4,8 @@
 
 mod executor;
 mod disk_io;
+mod model;
+mod router;
 
 use clap::Parser;
 
@@ -12,6 +14,8 @@ use clap::Parser;
 struct Args {
     #[arg(long)]
     model: String,
+    #[arg(long, default_value = "")]
+    config: String,
     #[arg(long, default_value = "")]
     prompt: String,
     #[arg(long, default_value_t = 50)]
@@ -39,6 +43,18 @@ fn main() {
         Err(e) => {
             eprintln!("[obsidian] executor init FAILED: {e}");
             std::process::exit(1);
+        }
+    }
+
+    if !args.config.is_empty() {
+        match model::Qwen3MoeConfig::from_file(std::path::Path::new(&args.config)) {
+            Ok(c) => println!(
+                "[obsidian] config: {} layers, hidden {}, {} experts top-{}, \
+                 head_dim {}, rope_theta {}, vocab {}",
+                c.num_hidden_layers, c.hidden_size, c.num_experts,
+                c.num_experts_per_tok, c.head_dim(), c.rope_theta, c.vocab_size
+            ),
+            Err(e) => eprintln!("[obsidian] config parse failed: {e}"),
         }
     }
 }
