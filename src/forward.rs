@@ -19,6 +19,7 @@ const SHARED: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
 
 #[repr(C)] #[derive(Clone, Copy)] struct DequantParams { in_features: u32, out_features: u32, group_size: u32 }
 #[repr(C)] #[derive(Clone, Copy)] struct RmsParams { dim: u32, eps: f32 }
+#[repr(C)] #[derive(Clone, Copy)] struct RopeParams { n_heads: u32, head_dim: u32, pos: u32, theta: f32 }
 
 pub struct Model {
     pub cfg: Qwen3MoeConfig,
@@ -101,6 +102,46 @@ impl Model {
         Ok(out)
     }
 
+    /// Router gate is 8-bit (not 4-bit) -> dequant-matvec on CPU. out=[n_experts].
+    fn gate_logits(&self, exec: &ObsidianExecutor, pre: &str, x_norm: &Buffer) -> Result<Buffer, String> {
+        let h = self.cfg.hidden_size;
+        let ne = self.cfg.num_experts;
+        let w = self.weights.get(&format!("{pre}mlp.gate.weight")).ok_or("gate.weight")?;
+        let s = self.weights.get(&format!("{pre}mlp.gate.scales")).ok_or("gate.scales")?;
+        let b = self.weights.get(&format!("{pre}mlp.gate.biases")).ok_or("gate.biases")?;
+        let (wq, sp, bp) = (w.contents() as *const u32, s.contents() as *const u16, b.contents() as *const u16);
+        let x = Self::read_f16(x_norm, h);
+        let (words, groups) = (h / 4, h / 64); // 8-bit: 4 values per u32
+        let mut logits = vec![0f32; ne];
+        for o in 0..ne {
+            let mut acc = 0f32;
+            for i in 0..h {
+                let word = unsafe { *wq.add(o * words + i / 4) };
+                let byte = ((word >> (8 * (i % 4))) & 0xFF) as f32;
+                let g = i / 64;
+                let sc = f16::from_bits(unsafe { *sp.add(o * groups + g) }).to_f32();
+                let bi = f16::from_bits(unsafe { *bp.add(o * groups + g) }).to_f32();
+                acc += (byte * sc + bi) * x[i];
+            }
+            logits[o] = acc;
+        }
+        Ok(self.f16_buf(exec, &logits))
+    }
+
+    fn rope(&self, exec: &ObsidianExecutor, buf: &Buffer, n_heads: u32, head_dim: u32, pos: u32) -> Result<(), String> {
+        let p = RopeParams { n_heads, head_dim, pos, theta: self.cfg.rope_theta };
+        let pso = exec.pipeline("rope_apply").ok_or("rope_apply")?;
+        let cb = exec.queue().new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pso);
+        enc.set_buffer(0, Some(buf), 0);
+        enc.set_bytes(1, std::mem::size_of::<RopeParams>() as u64, &p as *const _ as *const _);
+        let n = (n_heads * head_dim / 2) as u64;
+        enc.dispatch_thread_groups(MTLSize::new((n + 255) / 256, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding(); cb.commit(); cb.wait_until_completed();
+        Ok(())
+    }
+
     pub fn forward_layer(&mut self, exec: &ObsidianExecutor, il: usize, x: &Buffer) -> Result<Buffer, String> {
         let pre = format!("model.layers.{il}.");
         let h = self.cfg.hidden_size as u32;
@@ -110,16 +151,24 @@ impl Model {
 
         // input norm
         let xn = self.rmsnorm(exec, x, &self.weights.get(&format!("{pre}input_layernorm.weight")).ok_or("input_ln")?.clone(), h, 1)?;
-        // QKV  (q_norm/k_norm SKIPPED for first run)
+        // QKV projections
         let q = self.dequant_named(exec, &format!("{pre}self_attn.q_proj"), &xn, h, nq * hd)?;
         let k = self.dequant_named(exec, &format!("{pre}self_attn.k_proj"), &xn, h, nkv * hd)?;
         let v = self.dequant_named(exec, &format!("{pre}self_attn.v_proj"), &xn, h, nkv * hd)?;
-        // append projected k/v to cache (CPU readback of fp16)
+        // Qwen3 q/k RMSNorm over head_dim (per head)
+        let qnw = self.weights.get(&format!("{pre}self_attn.q_norm.weight")).ok_or("q_norm")?.clone();
+        let knw = self.weights.get(&format!("{pre}self_attn.k_norm.weight")).ok_or("k_norm")?.clone();
+        let q = self.rmsnorm(exec, &q, &qnw, hd, nq)?;
+        let k = self.rmsnorm(exec, &k, &knw, hd, nkv)?;
+        // RoPE on q and k at the current position (= cache length before append)
+        let pos = self.caches[il].seq_len as u32;
+        self.rope(exec, &q, nq, hd, pos)?;
+        self.rope(exec, &k, nkv, hd, pos)?;
+        // append normed+roped k and raw v
         let kbits: Vec<u16> = (0..(nkv*hd) as usize).map(|i| unsafe { *(k.contents() as *const u16).add(i) }).collect();
         let vbits: Vec<u16> = (0..(nkv*hd) as usize).map(|i| unsafe { *(v.contents() as *const u16).add(i) }).collect();
         self.caches[il].append(&kbits, &vbits);
-        // attention (rope(q) + sdpa)
-        let attn_out = self.attn.forward(exec, &q, &self.caches[il])?;
+        let attn_out = self.attn.sdpa(exec, &q, &self.caches[il])?;
         let o = self.dequant_named(exec, &format!("{pre}self_attn.o_proj"), &attn_out, nq * hd, h)?;
         // residual
         let mut hs = Self::read_f16(x, h as usize);
@@ -129,7 +178,7 @@ impl Model {
 
         // MoE
         let x1n = self.rmsnorm(exec, &x1, &self.weights.get(&format!("{pre}post_attention_layernorm.weight")).ok_or("post_ln")?.clone(), h, 1)?;
-        let gate = self.dequant_named(exec, &format!("{pre}mlp.gate"), &x1n, h, self.cfg.num_experts as u32)?;
+        let gate = self.gate_logits(exec, &pre, &x1n)?;
         let (ids, wts) = self.router.route(exec, &gate)?;
         let paged = crate::disk_io::read_experts_parallel(&self.experts, il, &ids);
         let mut by_e: HashMap<u32, HashMap<String, Vec<u8>>> = HashMap::new();
