@@ -37,6 +37,7 @@ env_logger = "0.11"
 # Enable with `--features mlx` after `brew install cmake`. The metal-rs
 # foundation compiles WITHOUT it.
 mlx-rs = { version = "0.25.3", optional = true }
+tokenizers = "0.23.1"
 
 [features]
 default = []
