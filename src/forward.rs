@@ -241,6 +241,10 @@ impl Model {
         self.f16_buf(exec, &row)
     }
 
+    pub fn reset_cache(&mut self) {
+        for c in &mut self.caches { c.seq_len = 0; }
+    }
+
     pub fn run_one_token(&mut self, exec: &ObsidianExecutor, tok: u32) -> Result<u32, String> {
         let mut x = self.embed(exec, tok);
         for il in 0..self.cfg.num_hidden_layers {
