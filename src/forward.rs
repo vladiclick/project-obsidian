@@ -1,7 +1,8 @@
-// forward.rs — Model + full single-token forward over Qwen3-30B-A3B.
-// First-run goals: load the real model, run end-to-end, produce a token id, and
-// surface concrete dim/alignment errors. Correctness (esp. 4-bit packing vs MLX,
-// RoPE, q/k-norm) is UNVERIFIED. q_norm/k_norm currently SKIPPED (flagged).
+// forward.rs — GPU-resident single-token forward over Qwen3-30B-A3B.
+// Dispatches commit WITHOUT wait (Metal serializes same-queue command buffers),
+// elementwise ops (residual/swiglu/accumulate/kv-append) run on the GPU, and the
+// only per-layer CPU sync is the router top-k readback (needed to page experts
+// off SSD). Validated to still produce token 271.
 
 use crate::attention::Attention;
 use crate::disk_io::{ExpertIndex, RawTensor};
@@ -13,6 +14,7 @@ use crate::weight_loader::Weights;
 use half::f16;
 use metal::{Buffer, MTLResourceOptions, MTLSize};
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::path::Path;
 
 const SHARED: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
@@ -20,6 +22,9 @@ const SHARED: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
 #[repr(C)] #[derive(Clone, Copy)] struct DequantParams { in_features: u32, out_features: u32, group_size: u32 }
 #[repr(C)] #[derive(Clone, Copy)] struct RmsParams { dim: u32, eps: f32 }
 #[repr(C)] #[derive(Clone, Copy)] struct RopeParams { n_heads: u32, head_dim: u32, pos: u32, theta: f32 }
+#[repr(C)] #[derive(Clone, Copy)] struct N { n: u32 }
+#[repr(C)] #[derive(Clone, Copy)] struct ScaledN { n: u32, scale: f32 }
+#[repr(C)] #[derive(Clone, Copy)] struct KvP { n_kv: u32, head_dim: u32, max_len: u32, pos: u32 }
 
 pub struct Model {
     pub cfg: Qwen3MoeConfig,
@@ -49,10 +54,8 @@ impl Model {
         Ok(Self { cfg, weights, experts, attn, router, caches })
     }
 
-    // ---- low-level helpers ----
-    fn buf(&self, exec: &ObsidianExecutor, bytes: usize) -> Buffer {
-        exec.device().new_buffer(bytes as u64, SHARED)
-    }
+    // ---- buffers ----
+    fn buf(&self, exec: &ObsidianExecutor, bytes: usize) -> Buffer { exec.device().new_buffer(bytes as u64, SHARED) }
     fn buf_from(&self, exec: &ObsidianExecutor, data: &[u8]) -> Buffer {
         let b = self.buf(exec, data.len());
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), b.contents() as *mut u8, data.len()); }
@@ -66,150 +69,139 @@ impl Model {
         let bits: Vec<u16> = v.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
         self.buf_from(exec, bytemuck::cast_slice(&bits))
     }
+    /// Drain the queue (empty cb + wait) — the only place the CPU blocks.
+    fn drain(exec: &ObsidianExecutor) {
+        let cb = exec.queue().new_command_buffer();
+        cb.commit();
+        cb.wait_until_completed();
+    }
 
-    fn dequant_matvec_bufs(&self, exec: &ObsidianExecutor, w: &Buffer, s: &Buffer, b: &Buffer,
-                           x: &Buffer, in_f: u32, out_f: u32) -> Result<Buffer, String> {
-        let out = self.buf(exec, out_f as usize * 2);
-        let p = DequantParams { in_features: in_f, out_features: out_f, group_size: 64 };
-        let pso = exec.pipeline("fused_dequant_matvec_4bit").ok_or("dequant kernel")?;
+    // ---- generic 1-D dispatch: commit, NO wait. params at slot bufs.len() ----
+    fn disp(&self, exec: &ObsidianExecutor, kernel: &str, bufs: &[&Buffer],
+            params: *const c_void, plen: usize, n: u64) -> Result<(), String> {
+        let pso = exec.pipeline(kernel).ok_or(format!("{kernel} missing"))?;
         let cb = exec.queue().new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(pso);
-        for (i, bf) in [w, s, b, x, &out].iter().enumerate() { enc.set_buffer(i as u64, Some(*bf), 0); }
-        enc.set_bytes(5, std::mem::size_of::<DequantParams>() as u64, &p as *const _ as *const _);
-        let tg = 256u64;
-        enc.dispatch_thread_groups(MTLSize::new((out_f as u64 + tg - 1) / tg, 1, 1), MTLSize::new(tg, 1, 1));
-        enc.end_encoding(); cb.commit(); cb.wait_until_completed();
+        for (i, b) in bufs.iter().enumerate() { enc.set_buffer(i as u64, Some(*b), 0); }
+        enc.set_bytes(bufs.len() as u64, plen as u64, params);
+        enc.dispatch_thread_groups(MTLSize::new((n + 255) / 256, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        Ok(())
+    }
+
+    fn dequant(&self, exec: &ObsidianExecutor, w: &Buffer, s: &Buffer, b: &Buffer, x: &Buffer,
+               in_f: u32, out_f: u32) -> Result<Buffer, String> {
+        let out = self.buf(exec, out_f as usize * 2);
+        let p = DequantParams { in_features: in_f, out_features: out_f, group_size: 64 };
+        self.disp(exec, "fused_dequant_matvec_4bit", &[w, s, b, x, &out],
+                  &p as *const _ as *const c_void, std::mem::size_of::<DequantParams>(), out_f as u64)?;
         Ok(out)
     }
     fn dequant_named(&self, exec: &ObsidianExecutor, name: &str, x: &Buffer, in_f: u32, out_f: u32) -> Result<Buffer, String> {
-        let w = self.weights.get(&format!("{name}.weight")).ok_or(format!("missing {name}.weight"))?;
-        let s = self.weights.get(&format!("{name}.scales")).ok_or(format!("missing {name}.scales"))?;
-        let b = self.weights.get(&format!("{name}.biases")).ok_or(format!("missing {name}.biases"))?;
-        self.dequant_matvec_bufs(exec, &w.clone(), &s.clone(), &b.clone(), x, in_f, out_f)
+        let w = self.weights.get(&format!("{name}.weight")).ok_or(format!("missing {name}.weight"))?.clone();
+        let s = self.weights.get(&format!("{name}.scales")).ok_or(format!("missing {name}.scales"))?.clone();
+        let b = self.weights.get(&format!("{name}.biases")).ok_or(format!("missing {name}.biases"))?.clone();
+        self.dequant(exec, &w, &s, &b, x, in_f, out_f)
     }
     fn rmsnorm(&self, exec: &ObsidianExecutor, x: &Buffer, w: &Buffer, dim: u32, rows: u32) -> Result<Buffer, String> {
         let out = self.buf(exec, (dim * rows) as usize * 2);
         let p = RmsParams { dim, eps: self.cfg.rms_norm_eps };
-        let pso = exec.pipeline("rmsnorm").ok_or("rmsnorm kernel")?;
+        let pso = exec.pipeline("rmsnorm").ok_or("rmsnorm")?;
         let cb = exec.queue().new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(pso);
-        for (i, bf) in [x, w, &out].iter().enumerate() { enc.set_buffer(i as u64, Some(*bf), 0); }
-        enc.set_bytes(3, std::mem::size_of::<RmsParams>() as u64, &p as *const _ as *const _);
+        for (i, b) in [x, w, &out].iter().enumerate() { enc.set_buffer(i as u64, Some(*b), 0); }
+        enc.set_bytes(3, std::mem::size_of::<RmsParams>() as u64, &p as *const _ as *const c_void);
         enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(256, 1, 1));
-        enc.end_encoding(); cb.commit(); cb.wait_until_completed();
+        enc.end_encoding();
+        cb.commit();
         Ok(out)
     }
-
-    /// Router gate is 8-bit (not 4-bit) -> dequant-matvec on CPU. out=[n_experts].
-    fn gate_logits(&self, exec: &ObsidianExecutor, pre: &str, x_norm: &Buffer) -> Result<Buffer, String> {
-        let h = self.cfg.hidden_size;
-        let ne = self.cfg.num_experts;
-        let w = self.weights.get(&format!("{pre}mlp.gate.weight")).ok_or("gate.weight")?;
-        let s = self.weights.get(&format!("{pre}mlp.gate.scales")).ok_or("gate.scales")?;
-        let b = self.weights.get(&format!("{pre}mlp.gate.biases")).ok_or("gate.biases")?;
-        let (wq, sp, bp) = (w.contents() as *const u32, s.contents() as *const u16, b.contents() as *const u16);
-        let x = Self::read_f16(x_norm, h);
-        let (words, groups) = (h / 4, h / 64); // 8-bit: 4 values per u32
-        let mut logits = vec![0f32; ne];
-        for o in 0..ne {
-            let mut acc = 0f32;
-            for i in 0..h {
-                let word = unsafe { *wq.add(o * words + i / 4) };
-                let byte = ((word >> (8 * (i % 4))) & 0xFF) as f32;
-                let g = i / 64;
-                let sc = f16::from_bits(unsafe { *sp.add(o * groups + g) }).to_f32();
-                let bi = f16::from_bits(unsafe { *bp.add(o * groups + g) }).to_f32();
-                acc += (byte * sc + bi) * x[i];
-            }
-            logits[o] = acc;
-        }
-        Ok(self.f16_buf(exec, &logits))
-    }
-
     fn rope(&self, exec: &ObsidianExecutor, buf: &Buffer, n_heads: u32, head_dim: u32, pos: u32) -> Result<(), String> {
         let p = RopeParams { n_heads, head_dim, pos, theta: self.cfg.rope_theta };
-        let pso = exec.pipeline("rope_apply").ok_or("rope_apply")?;
-        let cb = exec.queue().new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(pso);
-        enc.set_buffer(0, Some(buf), 0);
-        enc.set_bytes(1, std::mem::size_of::<RopeParams>() as u64, &p as *const _ as *const _);
-        let n = (n_heads * head_dim / 2) as u64;
-        enc.dispatch_thread_groups(MTLSize::new((n + 255) / 256, 1, 1), MTLSize::new(256, 1, 1));
-        enc.end_encoding(); cb.commit(); cb.wait_until_completed();
-        Ok(())
+        self.disp(exec, "rope_apply", &[buf], &p as *const _ as *const c_void,
+                  std::mem::size_of::<RopeParams>(), (n_heads * head_dim / 2) as u64)
     }
-
-    pub fn forward_layer(&mut self, exec: &ObsidianExecutor, il: usize, x: &Buffer) -> Result<Buffer, String> {
-        let pre = format!("model.layers.{il}.");
+    fn add(&self, exec: &ObsidianExecutor, a: &Buffer, b: &Buffer, n: u32) -> Result<Buffer, String> {
+        let out = self.buf(exec, n as usize * 2);
+        let p = N { n };
+        self.disp(exec, "ew_add", &[a, b, &out], &p as *const _ as *const c_void, 4, n as u64)?;
+        Ok(out)
+    }
+    fn swiglu(&self, exec: &ObsidianExecutor, g: &Buffer, u: &Buffer, n: u32) -> Result<Buffer, String> {
+        let out = self.buf(exec, n as usize * 2);
+        let p = N { n };
+        self.disp(exec, "ew_swiglu", &[g, u, &out], &p as *const _ as *const c_void, 4, n as u64)?;
+        Ok(out)
+    }
+    fn scaled_add(&self, exec: &ObsidianExecutor, acc: &Buffer, y: &Buffer, scale: f32, n: u32) -> Result<(), String> {
+        let p = ScaledN { n, scale };
+        self.disp(exec, "ew_scaled_add", &[acc, y], &p as *const _ as *const c_void,
+                  std::mem::size_of::<ScaledN>(), n as u64)
+    }
+    fn kv_append_gpu(&self, exec: &ObsidianExecutor, src: &Buffer, dst: &Buffer, n_kv: u32, head_dim: u32, max_len: u32, pos: u32) -> Result<(), String> {
+        let p = KvP { n_kv, head_dim, max_len, pos };
+        self.disp(exec, "kv_append", &[src, dst], &p as *const _ as *const c_void,
+                  std::mem::size_of::<KvP>(), (n_kv * head_dim) as u64)
+    }
+    fn gate_gpu(&self, exec: &ObsidianExecutor, pre: &str, x: &Buffer) -> Result<Buffer, String> {
         let h = self.cfg.hidden_size as u32;
-        let hd = self.cfg.head_dim() as u32;
-        let nq = self.cfg.num_attention_heads as u32;
-        let nkv = self.cfg.num_key_value_heads as u32;
+        let ne = self.cfg.num_experts as u32;
+        let w = self.weights.get(&format!("{pre}mlp.gate.weight")).ok_or("gate.w")?.clone();
+        let s = self.weights.get(&format!("{pre}mlp.gate.scales")).ok_or("gate.s")?.clone();
+        let b = self.weights.get(&format!("{pre}mlp.gate.biases")).ok_or("gate.b")?.clone();
+        let out = self.buf(exec, ne as usize * 2);
+        let p = DequantParams { in_features: h, out_features: ne, group_size: 64 };
+        self.disp(exec, "dequant_matvec_8bit", &[&w, &s, &b, x, &out],
+                  &p as *const _ as *const c_void, std::mem::size_of::<DequantParams>(), ne as u64)?;
+        Ok(out)
+    }
+    fn forward_layer(&mut self, exec: &ObsidianExecutor, il: usize, x: &Buffer) -> Result<Buffer, String> {
+        let pre = format!("model.layers.{il}.");
+        let (h, hd, nq, nkv) = (self.cfg.hidden_size as u32, self.cfg.head_dim() as u32,
+                                self.cfg.num_attention_heads as u32, self.cfg.num_key_value_heads as u32);
+        let moe_inter = self.cfg.moe_intermediate_size as u32;
 
-        // input norm
-        let xn = self.rmsnorm(exec, x, &self.weights.get(&format!("{pre}input_layernorm.weight")).ok_or("input_ln")?.clone(), h, 1)?;
-        // QKV projections
+        let xn = self.rmsnorm(exec, x, &self.weights.get(&format!("{pre}input_layernorm.weight")).ok_or("in_ln")?.clone(), h, 1)?;
         let q = self.dequant_named(exec, &format!("{pre}self_attn.q_proj"), &xn, h, nq * hd)?;
         let k = self.dequant_named(exec, &format!("{pre}self_attn.k_proj"), &xn, h, nkv * hd)?;
         let v = self.dequant_named(exec, &format!("{pre}self_attn.v_proj"), &xn, h, nkv * hd)?;
-        // Qwen3 q/k RMSNorm over head_dim (per head)
-        let qnw = self.weights.get(&format!("{pre}self_attn.q_norm.weight")).ok_or("q_norm")?.clone();
-        let knw = self.weights.get(&format!("{pre}self_attn.k_norm.weight")).ok_or("k_norm")?.clone();
-        let q = self.rmsnorm(exec, &q, &qnw, hd, nq)?;
-        let k = self.rmsnorm(exec, &k, &knw, hd, nkv)?;
-        // RoPE on q and k at the current position (= cache length before append)
+        let q = self.rmsnorm(exec, &q, &self.weights.get(&format!("{pre}self_attn.q_norm.weight")).ok_or("qn")?.clone(), hd, nq)?;
+        let k = self.rmsnorm(exec, &k, &self.weights.get(&format!("{pre}self_attn.k_norm.weight")).ok_or("kn")?.clone(), hd, nkv)?;
         let pos = self.caches[il].seq_len as u32;
         self.rope(exec, &q, nq, hd, pos)?;
         self.rope(exec, &k, nkv, hd, pos)?;
-        // append normed+roped k and raw v
-        let kbits: Vec<u16> = (0..(nkv*hd) as usize).map(|i| unsafe { *(k.contents() as *const u16).add(i) }).collect();
-        let vbits: Vec<u16> = (0..(nkv*hd) as usize).map(|i| unsafe { *(v.contents() as *const u16).add(i) }).collect();
-        self.caches[il].append(&kbits, &vbits);
-        let attn_out = self.attn.sdpa(exec, &q, &self.caches[il])?;
-        let o = self.dequant_named(exec, &format!("{pre}self_attn.o_proj"), &attn_out, nq * hd, h)?;
-        // residual
-        let mut hs = Self::read_f16(x, h as usize);
-        let ov = Self::read_f16(&o, h as usize);
-        for i in 0..h as usize { hs[i] += ov[i]; }
-        let x1 = self.f16_buf(exec, &hs);
+        let ml = self.caches[il].max_len as u32;
+        self.kv_append_gpu(exec, &k, &self.caches[il].k.clone(), nkv, hd, ml, pos)?;
+        self.kv_append_gpu(exec, &v, &self.caches[il].v.clone(), nkv, hd, ml, pos)?;
+        self.caches[il].seq_len += 1;
+        let attn = self.attn.sdpa(exec, &q, &self.caches[il])?;
+        let o = self.dequant_named(exec, &format!("{pre}self_attn.o_proj"), &attn, nq * hd, h)?;
+        let x1 = self.add(exec, x, &o, h)?;                      // residual (GPU)
 
-        // MoE
         let x1n = self.rmsnorm(exec, &x1, &self.weights.get(&format!("{pre}post_attention_layernorm.weight")).ok_or("post_ln")?.clone(), h, 1)?;
-        let gate = self.gate_logits(exec, &pre, &x1n)?;
-        let (ids, wts) = self.router.route(exec, &gate)?;
+        let gate = self.gate_gpu(exec, &pre, &x1n)?;
+        let (ids, wts) = self.router.route(exec, &gate)?;        // <-- only CPU sync/layer (commit+wait)
         let paged = crate::disk_io::read_experts_parallel(&self.experts, il, &ids);
         let mut by_e: HashMap<u32, HashMap<String, Vec<u8>>> = HashMap::new();
         for RawTensor { eid, key, bytes } in paged { by_e.entry(eid).or_default().insert(key, bytes); }
 
-        let moe_inter = self.cfg.moe_intermediate_size as u32;
-        let mut acc = vec![0f32; h as usize];
         for (rank, &e) in ids.iter().enumerate() {
             let t = by_e.get(&e).ok_or(format!("expert {e} not paged"))?;
-            let gw = self.buf_from(exec, &t["gate_proj.weight"]); let gs = self.buf_from(exec, &t["gate_proj.scales"]); let gb = self.buf_from(exec, &t["gate_proj.biases"]);
-            let uw = self.buf_from(exec, &t["up_proj.weight"]);   let us = self.buf_from(exec, &t["up_proj.scales"]);   let ub = self.buf_from(exec, &t["up_proj.biases"]);
-            let dw = self.buf_from(exec, &t["down_proj.weight"]); let ds = self.buf_from(exec, &t["down_proj.scales"]); let db = self.buf_from(exec, &t["down_proj.biases"]);
-            let g = self.dequant_matvec_bufs(exec, &gw, &gs, &gb, &x1n, h, moe_inter)?;
-            let u = self.dequant_matvec_bufs(exec, &uw, &us, &ub, &x1n, h, moe_inter)?;
-            let gv = Self::read_f16(&g, moe_inter as usize);
-            let uv = Self::read_f16(&u, moe_inter as usize);
-            let sg: Vec<f32> = (0..moe_inter as usize).map(|i| { let x = gv[i]; (x / (1.0 + (-x).exp())) * uv[i] }).collect();
-            let sgb = self.f16_buf(exec, &sg);
-            let y = self.dequant_matvec_bufs(exec, &dw, &ds, &db, &sgb, moe_inter, h)?;
-            let yv = Self::read_f16(&y, h as usize);
-            let w = wts[rank];
-            for i in 0..h as usize { acc[i] += w * yv[i]; }
+            let (gw, gs, gb) = (self.buf_from(exec, &t["gate_proj.weight"]), self.buf_from(exec, &t["gate_proj.scales"]), self.buf_from(exec, &t["gate_proj.biases"]));
+            let (uw, us, ub) = (self.buf_from(exec, &t["up_proj.weight"]), self.buf_from(exec, &t["up_proj.scales"]), self.buf_from(exec, &t["up_proj.biases"]));
+            let (dw, ds, db) = (self.buf_from(exec, &t["down_proj.weight"]), self.buf_from(exec, &t["down_proj.scales"]), self.buf_from(exec, &t["down_proj.biases"]));
+            let g = self.dequant(exec, &gw, &gs, &gb, &x1n, h, moe_inter)?;
+            let u = self.dequant(exec, &uw, &us, &ub, &x1n, h, moe_inter)?;
+            let sg = self.swiglu(exec, &g, &u, moe_inter)?;
+            let y = self.dequant(exec, &dw, &ds, &db, &sg, moe_inter, h)?;
+            self.scaled_add(exec, &x1, &y, wts[rank], h)?;       // x1 += w*y (GPU)
         }
-        for i in 0..h as usize { acc[i] += hs[i]; } // residual
-        Ok(self.f16_buf(exec, &acc))
+        Ok(x1)
     }
 
-    /// CPU-dequant one embedding row -> fp16 buffer [hidden].
-    /// NOTE: assumes f16 scales/biases; mlx repos store them BF16 for non-expert
-    /// tensors -> this (and the dequant shader) will be WRONG until bf16 is
-    /// converted at load. Flagged; first run is for plumbing/dim errors.
     pub fn embed(&self, exec: &ObsidianExecutor, tok: u32) -> Buffer {
         let h = self.cfg.hidden_size;
         let (words, groups) = (h / 8, h / 64);
@@ -229,26 +221,16 @@ impl Model {
         self.f16_buf(exec, &row)
     }
 
-    fn stat(label: &str, buf: &Buffer, n: usize) {
-        let v = Self::read_f16(buf, n);
-        let (mut mn, mut mx, mut nan) = (f32::INFINITY, f32::NEG_INFINITY, 0usize);
-        for &x in &v { if x.is_nan() { nan += 1 } else { mn = mn.min(x); mx = mx.max(x) } }
-        eprintln!("[stat] {label}: min={mn:.4} max={mx:.4} nan={nan}/{n}");
-    }
-
     pub fn run_one_token(&mut self, exec: &ObsidianExecutor, tok: u32) -> Result<u32, String> {
         let mut x = self.embed(exec, tok);
-        Self::stat("embed", &x, self.cfg.hidden_size);
         for il in 0..self.cfg.num_hidden_layers {
             x = self.forward_layer(exec, il, &x)?;
-            if il == 0 || il == 1 { Self::stat(&format!("layer{il}"), &x, self.cfg.hidden_size); }
         }
         let h = self.cfg.hidden_size as u32;
-        let nw = self.weights.get("model.norm.weight").ok_or("model.norm.weight")?.clone();
+        let nw = self.weights.get("model.norm.weight").ok_or("model.norm")?.clone();
         let xn = self.rmsnorm(exec, &x, &nw, h, 1)?;
-        Self::stat("final_norm", &xn, self.cfg.hidden_size);
         let logits = self.dequant_named(exec, "lm_head", &xn, h, self.cfg.vocab_size as u32)?;
-        Self::stat("logits", &logits, self.cfg.vocab_size);
+        Self::drain(exec);                                       // final CPU sync
         let lv = Self::read_f16(&logits, self.cfg.vocab_size);
         let mut best = 0usize;
         let mut bv = f32::NEG_INFINITY;

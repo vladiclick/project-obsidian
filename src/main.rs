@@ -71,12 +71,25 @@ fn main() {
         let mut m = match forward::Model::new(&model_dir, &expert_dir, &exec) {
             Ok(m) => m, Err(e) => { eprintln!("[obsidian] model load FAILED: {e}"); std::process::exit(1); }
         };
-        println!("[obsidian] loaded in {:.1}s; running 1 token (input id {}) ...",
-                 t0.elapsed().as_secs_f32(), args.token);
-        let t1 = std::time::Instant::now();
-        match m.run_one_token(&exec, args.token) {
-            Ok(tok) => println!("[obsidian] next token id = {} ({:.1}s)", tok, t1.elapsed().as_secs_f32()),
-            Err(e) => { eprintln!("[obsidian] forward FAILED: {e}"); std::process::exit(1); }
+        let n = args.max_tokens.max(1);
+        println!("[obsidian] loaded in {:.1}s; generating {} tokens (input id {}) ...",
+                 t0.elapsed().as_secs_f32(), n, args.token);
+        let mut tok = args.token;
+        let mut times = Vec::new();
+        for i in 0..n {
+            let t1 = std::time::Instant::now();
+            match m.run_one_token(&exec, tok) {
+                Ok(next) => { let dt = t1.elapsed().as_secs_f32();
+                    println!("[obsidian] tok {i}: id={next} ({:.3}s, {:.1}ms/layer)", dt, dt * 1000.0 / m.cfg.num_hidden_layers as f32);
+                    times.push(dt); tok = next; }
+                Err(e) => { eprintln!("[obsidian] forward FAILED: {e}"); std::process::exit(1); }
+            }
+        }
+        // steady-state = mean excluding the first (cold) token
+        if times.len() > 1 {
+            let ss: f32 = times[1..].iter().sum::<f32>() / (times.len() - 1) as f32;
+            println!("[obsidian] STEADY-STATE: {:.3}s/token = {:.2} tok/s, {:.1}ms/layer",
+                     ss, 1.0 / ss, ss * 1000.0 / m.cfg.num_hidden_layers as f32);
         }
     }
 }

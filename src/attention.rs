@@ -35,8 +35,7 @@ impl Attention {
         enc.set_bytes(4, std::mem::size_of::<SdpaParams>() as u64, &sp as *const _ as *const _);
         enc.dispatch_thread_groups(MTLSize::new(self.n_heads as u64, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        cb.commit();   // no wait: same-queue ordering syncs with later dispatches
         Ok(out)
     }
 }
