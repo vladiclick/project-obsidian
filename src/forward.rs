@@ -33,6 +33,9 @@ pub struct Model {
     pub attn: Attention,
     pub router: MoeRouter,
     pub caches: Vec<KvCache>,
+    /// Pre-allocated expert scratch: top_k slots x 9 tensors (gate/up/down x
+    /// weight/scales/biases). Reused across layers (router drain syncs them).
+    expert_pool: Vec<Buffer>,
 }
 
 impl Model {
@@ -51,7 +54,18 @@ impl Model {
         let caches = (0..cfg.num_hidden_layers)
             .map(|_| KvCache::new(exec.device(), cfg.num_key_value_heads, cfg.head_dim(), 4096))
             .collect();
-        Ok(Self { cfg, weights, experts, attn, router, caches })
+        // expert scratch pool: top_k slots x 9 tensors (w=moe_inter*hidden/2 bytes
+        // for 4-bit; scales/biases = moe_inter*hidden/64*2)
+        let w_size = (cfg.moe_intermediate_size * cfg.hidden_size / 2) as u64;
+        let sb_size = (cfg.moe_intermediate_size * cfg.hidden_size / 64 * 2) as u64;
+        let mut expert_pool = Vec::with_capacity(cfg.num_experts_per_tok * 9);
+        for _ in 0..cfg.num_experts_per_tok {
+            for k in 0..9 {
+                let sz = if k % 3 == 0 { w_size } else { sb_size };
+                expert_pool.push(exec.device().new_buffer(sz, SHARED));
+            }
+        }
+        Ok(Self { cfg, weights, experts, attn, router, caches, expert_pool })
     }
 
     // ---- buffers ----
@@ -60,6 +74,9 @@ impl Model {
         let b = self.buf(exec, data.len());
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), b.contents() as *mut u8, data.len()); }
         b
+    }
+    fn copy_into(&self, buf: &Buffer, data: &[u8]) {
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents() as *mut u8, data.len()); }
     }
     fn read_f16(buf: &Buffer, n: usize) -> Vec<f32> {
         let p = buf.contents() as *const u16;
@@ -188,15 +205,18 @@ impl Model {
         let mut by_e: HashMap<u32, HashMap<String, Vec<u8>>> = HashMap::new();
         for RawTensor { eid, key, bytes } in paged { by_e.entry(eid).or_default().insert(key, bytes); }
 
+        const KEYS: [&str; 9] = ["gate_proj.weight", "gate_proj.scales", "gate_proj.biases",
+                                 "up_proj.weight", "up_proj.scales", "up_proj.biases",
+                                 "down_proj.weight", "down_proj.scales", "down_proj.biases"];
         for (rank, &e) in ids.iter().enumerate() {
             let t = by_e.get(&e).ok_or(format!("expert {e} not paged"))?;
-            let (gw, gs, gb) = (self.buf_from(exec, &t["gate_proj.weight"]), self.buf_from(exec, &t["gate_proj.scales"]), self.buf_from(exec, &t["gate_proj.biases"]));
-            let (uw, us, ub) = (self.buf_from(exec, &t["up_proj.weight"]), self.buf_from(exec, &t["up_proj.scales"]), self.buf_from(exec, &t["up_proj.biases"]));
-            let (dw, ds, db) = (self.buf_from(exec, &t["down_proj.weight"]), self.buf_from(exec, &t["down_proj.scales"]), self.buf_from(exec, &t["down_proj.biases"]));
-            let g = self.dequant(exec, &gw, &gs, &gb, &x1n, h, moe_inter)?;
-            let u = self.dequant(exec, &uw, &us, &ub, &x1n, h, moe_inter)?;
+            let b = rank * 9;
+            for (k, key) in KEYS.iter().enumerate() { self.copy_into(&self.expert_pool[b + k], &t[*key]); }
+            let p = &self.expert_pool;
+            let g = self.dequant(exec, &p[b], &p[b + 1], &p[b + 2], &x1n, h, moe_inter)?;
+            let u = self.dequant(exec, &p[b + 3], &p[b + 4], &p[b + 5], &x1n, h, moe_inter)?;
             let sg = self.swiglu(exec, &g, &u, moe_inter)?;
-            let y = self.dequant(exec, &dw, &ds, &db, &sg, moe_inter, h)?;
+            let y = self.dequant(exec, &p[b + 6], &p[b + 7], &p[b + 8], &sg, moe_inter, h)?;
             self.scaled_add(exec, &x1, &y, wts[rank], h)?;       // x1 += w*y (GPU)
         }
         Ok(x1)

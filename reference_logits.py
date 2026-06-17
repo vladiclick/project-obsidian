@@ -30,9 +30,13 @@ logits = m._head(h[:, -1:])[0, -1]   # [vocab]
 mx.eval(logits)
 stat("logits", logits)
 
-argmax = int(mx.argmax(logits).item())
-top = mx.argsort(-logits)[:5].tolist()
-vals = [round(float(logits[i].item()), 3) for i in top]
-print(f"[airllm] input id {TOK} -> next token id = {argmax}")
-print(f"[airllm] top5 ids = {top}")
-print(f"[airllm] top5 logits = {vals}")
+y = int(mx.argmax(logits).item())
+seq = [y]
+for _ in range(7):  # 8-token greedy sequence to compare vs Obsidian
+    h = m._embed(mx.array([[y]]))
+    for il in range(m.n_layers):
+        h, caches[il] = m._layer(h, il, None, caches[il])
+        mx.eval(h, *caches[il])
+    y = int(mx.argmax(m._head(h[:, -1:])[0, -1]).item())
+    seq.append(y)
+print(f"[airllm] greedy seq from {TOK}: {seq}")
