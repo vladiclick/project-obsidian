@@ -88,14 +88,8 @@ fn main() {
             let eos = tk.token_to_id("<|im_end|>").unwrap_or(151645);
             println!("[obsidian] prompt = {:?} ({} tokens); generating {} ...", args.prompt, ids.len(), n);
             let t1 = std::time::Instant::now();
-            let mut next = 0u32;
-            for &t in &ids { next = m.run_one_token(&exec, t).expect("prefill"); }
-            let mut gen = vec![next];
-            for _ in 0..n - 1 {
-                if next == eos { break; }
-                next = m.run_one_token(&exec, next).expect("decode");
-                gen.push(next);
-            }
+            // run_turn = prefix reuse + batched prefill (falls back to per-token)
+            let gen = m.run_turn(&exec, &ids, n, eos).expect("turn");
             let secs = t1.elapsed().as_secs_f32();
             let text = tk.decode(&gen, true).unwrap_or_default();
             println!("[obsidian] ---- OUTPUT ----\n{}\n----------------", text);
@@ -134,15 +128,57 @@ fn serve(args: &Args) {
     let mut m = forward::Model::new(&model_dir, &expert_dir, &exec).expect("model");
     let tk = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("tokenizer");
     let eos = tk.token_to_id("<|im_end|>").unwrap_or(151645);
+    let current_model_name = model_dir.file_name().unwrap_or(std::ffi::OsStr::new("obsidian"))
+        .to_string_lossy().to_string();
+
+    // Scan models directory for /v1/models
+    let models_dir = model_dir.parent().unwrap_or(&model_dir).to_path_buf();
 
     let addr = format!("0.0.0.0:{}", args.port);
     let server = tiny_http::Server::http(&addr).unwrap_or_else(|e| { eprintln!("bind {addr}: {e}"); std::process::exit(1); });
-    println!("[obsidian] API LIVE on http://{addr}/v1/chat/completions");
+    println!("[obsidian] API LIVE on http://{addr}");
+    println!("[obsidian]   POST /v1/chat/completions");
+    println!("[obsidian]   GET  /v1/models");
+    println!("[obsidian]   GET  /health");
 
     for mut req in server.incoming_requests() {
+        let method = req.method();
+        let url = req.url().to_string();
+
+        // ── GET /health ──────────────────────────────────────────────
+        if method == &tiny_http::Method::Get && url == "/health" {
+            let out = serde_json::json!({
+                "status": "ok",
+                "model": current_model_name,
+                "loaded": true,
+                "engine": "obsidian-rust-metal",
+                "turns": m.turns,
+                "last_prefill_ms": m.last_prefill_ms,
+                "last_prefilled_tokens": m.last_prefilled,
+                "last_reused_tokens": m.last_reused,
+                "kv_max_len": m.caches.first().map(|c| c.max_len).unwrap_or(0)
+            });
+            let resp = tiny_http::Response::from_string(out.to_string())
+                .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap());
+            let _ = req.respond(resp);
+            continue;
+        }
+
+        // ── GET /v1/models ───────────────────────────────────────────
+        if method == &tiny_http::Method::Get && url == "/v1/models" {
+            let out = build_models_list(&models_dir, &current_model_name);
+            let resp = tiny_http::Response::from_string(out.to_string())
+                .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap());
+            let _ = req.respond(resp);
+            continue;
+        }
+
+        // ── POST /v1/chat/completions ────────────────────────────────
         let mut body = String::new();
         let _ = req.as_reader().read_to_string(&mut body);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+
+        let stream = v["stream"].as_bool().unwrap_or(false);
         let max_tokens = v["max_tokens"].as_u64().unwrap_or(128).clamp(1, 1024) as usize;
 
         let mut prompt = String::new();
@@ -156,25 +192,92 @@ fn serve(args: &Args) {
         prompt.push_str("<|im_start|>assistant\n");
 
         let ids: Vec<u32> = tk.encode(prompt, false).expect("encode").get_ids().to_vec();
-        m.reset_cache();
-        let mut next = 0u32;
-        for &t in &ids { next = m.run_one_token(&exec, t).expect("prefill"); }
-        let mut gen = vec![next];
-        for _ in 0..max_tokens - 1 {
-            if next == eos { break; }
-            next = m.run_one_token(&exec, next).expect("decode");
-            gen.push(next);
-        }
+        // Cross-request prefix reuse (do NOT reset the cache): run_turn reuses
+        // the K/V of the common prefix and only prefills the new suffix.
+        let gen = m.run_turn(&exec, &ids, max_tokens, eos).expect("turn");
         let text = tk.decode(&gen, true).unwrap_or_default();
-        let out = serde_json::json!({
-            "id": "chatcmpl-obsidian", "object": "chat.completion",
-            "created": 0, "model": "obsidian-qwen3-30b-a3b",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": ids.len(), "completion_tokens": gen.len(), "total_tokens": ids.len() + gen.len()}
-        });
-        println!("[obsidian] req: {} prompt tok -> {} gen tok", ids.len(), gen.len());
-        let resp = tiny_http::Response::from_string(out.to_string())
-            .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap());
-        let _ = req.respond(resp);
+
+        if stream {
+            // SSE streaming (OpenAI-compatible chunked response)
+            let chunks = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                    "id": "chatcmpl-obsidian", "object": "chat.completion.chunk",
+                    "created": 0, "model": current_model_name,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+                }),
+                serde_json::json!({
+                    "id": "chatcmpl-obsidian", "object": "chat.completion.chunk",
+                    "created": 0, "model": current_model_name,
+                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}]
+                })
+            );
+            let resp = tiny_http::Response::from_string(chunks)
+                .with_header("Content-Type: text/event-stream".parse::<tiny_http::Header>().unwrap())
+                .with_header("Cache-Control: no-cache".parse::<tiny_http::Header>().unwrap());
+            let _ = req.respond(resp);
+        } else {
+            let out = serde_json::json!({
+                "id": "chatcmpl-obsidian", "object": "chat.completion",
+                "created": 0, "model": current_model_name,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": ids.len(), "completion_tokens": gen.len(), "total_tokens": ids.len() + gen.len()}
+            });
+            println!("[obsidian] req: {} prompt tok -> {} gen tok", ids.len(), gen.len());
+            let resp = tiny_http::Response::from_string(out.to_string())
+                .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap());
+            let _ = req.respond(resp);
+        }
     }
+}
+
+/// Scan the models directory and return an OpenAI-compatible model list.
+fn build_models_list(models_dir: &std::path::Path, active_model: &str) -> serde_json::Value {
+    let mut models: Vec<serde_json::Value> = Vec::new();
+
+    if models_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(models_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.join("config.json").exists() {
+                    let name = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let owned_by = if name.contains("Qwen") { "qwen" }
+                        else if name.contains("DeepSeek") { "deepseek" }
+                        else { "obsidian" };
+                    let created = path.metadata().ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+                        .unwrap_or(0);
+
+                    models.push(serde_json::json!({
+                        "id": name,
+                        "object": "model",
+                        "created": created,
+                        "owned_by": owned_by,
+                    }));
+                }
+            }
+        }
+    }
+
+    // Always include the currently loaded model
+    let has_active = models.iter().any(|m| m["id"].as_str() == Some(active_model));
+    if !has_active {
+        models.push(serde_json::json!({
+            "id": active_model,
+            "object": "model",
+            "created": 0,
+            "owned_by": "obsidian",
+        }));
+    }
+
+    // Sort by name
+    models.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+
+    serde_json::json!({
+        "object": "list",
+        "data": models
+    })
 }

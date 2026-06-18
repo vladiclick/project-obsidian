@@ -56,6 +56,44 @@ impl MoeRouter {
         Ok((ids, wts))
     }
 
+    /// Dispatch the top-k routing kernel WITHOUT waiting; returns the output
+    /// buffers. The caller drains the queue ONCE for a whole batch of tokens
+    /// (instead of per-token commit+wait), then calls `read_route` on each.
+    /// Same kernel as `route` -> bit-exact routing, just batched syncing.
+    pub fn route_dispatch(&self, exec: &ObsidianExecutor, gate_logits: &Buffer) -> Result<(Buffer, Buffer), String> {
+        let dev = exec.device();
+        let k = self.top_k as u64;
+        let idx_buf = dev.new_buffer(k * 4, MTLResourceOptions::StorageModeShared);
+        let w_buf = dev.new_buffer(k * 2, MTLResourceOptions::StorageModeShared);
+        let params = RoutingParams {
+            n_experts: self.n_experts, top_k: self.top_k, norm_topk: self.norm_topk as u32,
+        };
+        let pso = exec.pipeline("moe_routing_topk").ok_or("moe_routing_topk missing")?;
+        let cb = exec.queue().new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pso);
+        enc.set_buffer(0, Some(gate_logits), 0);
+        enc.set_buffer(1, Some(&idx_buf), 0);
+        enc.set_buffer(2, Some(&w_buf), 0);
+        enc.set_bytes(3, std::mem::size_of::<RoutingParams>() as u64,
+                      &params as *const _ as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        cb.commit(); // NO wait — batched drain happens once for all tokens
+        Ok((idx_buf, w_buf))
+    }
+
+    /// Read top-k ids+weights from buffers produced by `route_dispatch`
+    /// (only valid after the queue has been drained).
+    pub fn read_route(&self, idx_buf: &Buffer, w_buf: &Buffer) -> (Vec<u32>, Vec<f32>) {
+        let ip = idx_buf.contents() as *const i32;
+        let wp = w_buf.contents() as *const u16;
+        let ids: Vec<u32> = (0..self.top_k as isize).map(|i| unsafe { *ip.offset(i) } as u32).collect();
+        let wts: Vec<f32> = (0..self.top_k as isize)
+            .map(|i| half::f16::from_bits(unsafe { *wp.offset(i) }).to_f32()).collect();
+        (ids, wts)
+    }
+
     /// Full step: route, then page the selected experts off disk.
     pub fn route_and_page(
         &self,

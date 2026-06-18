@@ -14,6 +14,8 @@ pub struct Attention {
     pub n_kv: u32,
     pub head_dim: u32,
     pub theta: f32,
+    /// device score scratch [n_heads * max_len] f32, allocated once + reused.
+    pub scratch: Buffer,
 }
 
 impl Attention {
@@ -31,8 +33,8 @@ impl Attention {
         let cb = exec.queue().new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(pso);
-        for (i, b) in [q, &kv.k, &kv.v, &out].iter().enumerate() { enc.set_buffer(i as u64, Some(*b), 0); }
-        enc.set_bytes(4, std::mem::size_of::<SdpaParams>() as u64, &sp as *const _ as *const _);
+        for (i, b) in [q, &kv.k, &kv.v, &out, &self.scratch].iter().enumerate() { enc.set_buffer(i as u64, Some(*b), 0); }
+        enc.set_bytes(5, std::mem::size_of::<SdpaParams>() as u64, &sp as *const _ as *const _);
         enc.dispatch_thread_groups(MTLSize::new(self.n_heads as u64, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
         cb.commit();   // no wait: same-queue ordering syncs with later dispatches
