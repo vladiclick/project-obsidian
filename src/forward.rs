@@ -20,6 +20,7 @@ use std::path::Path;
 const SHARED: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
 
 #[repr(C)] #[derive(Clone, Copy)] struct DequantParams { in_features: u32, out_features: u32, group_size: u32 }
+#[repr(C)] #[derive(Clone, Copy)] struct MatmulParams { in_features: u32, out_features: u32, group_size: u32, n_tokens: u32 }
 #[repr(C)] #[derive(Clone, Copy)] struct RmsParams { dim: u32, eps: f32 }
 #[repr(C)] #[derive(Clone, Copy)] struct RopeParams { n_heads: u32, head_dim: u32, pos: u32, theta: f32 }
 #[repr(C)] #[derive(Clone, Copy)] struct N { n: u32 }
@@ -119,6 +120,10 @@ impl Model {
         let base_pos = self.caches[0].seq_len;
         if base_pos + t > self.caches[0].max_len { return Err("context overflow".into()); }
         self.ensure_batch_pool(exec);
+        // Phase 2: batched GEMM for the expert FFN (the compute bulk). Gated:
+        // OBSIDIAN_NO_GEMM=1 -> per-token matvec (Phase 1). Kernel must exist.
+        let use_gemm = exec.pipeline("matmul_dequant_4bit").is_some()
+            && std::env::var("OBSIDIAN_NO_GEMM").is_err();
 
         const KEYS: [&str; 9] = ["gate_proj.weight", "gate_proj.scales", "gate_proj.biases",
                                  "up_proj.weight", "up_proj.scales", "up_proj.biases",
@@ -191,17 +196,53 @@ impl Model {
                 slot_of.insert(e, slot);
             }
 
-            // apply experts per token (no sync), accumulate into x1s[i]
-            for i in 0..t {
-                let (ids, wts) = &per_tok[i];
-                for (rank, &e) in ids.iter().enumerate() {
+            if use_gemm {
+                // GROUPED batched expert FFN: one matmul per (expert, projection)
+                // over all tokens routed to that expert. x1n is synced by the
+                // route drain above, so gathering rows on CPU is safe.
+                let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
+                for i in 0..t { for &e in &per_tok[i].0 { groups.entry(e).or_default().push(i); } }
+                let mut ye_of: HashMap<u32, Buffer> = HashMap::new();
+                let mut row_of: HashMap<(u32, usize), usize> = HashMap::new();
+                let hs = h as usize;
+                for (&e, toks) in &groups {
+                    let n_e = toks.len();
+                    let xe = self.buf(exec, n_e * hs * 2);
+                    let dst = xe.contents() as *mut u8;
+                    for (r, &i) in toks.iter().enumerate() {
+                        unsafe { std::ptr::copy_nonoverlapping(
+                            x1ns[i].contents() as *const u8, dst.add(r * hs * 2), hs * 2); }
+                        row_of.insert((e, i), r);
+                    }
                     let base = slot_of[&e] * 9;
                     let p = self.batch_pool.as_ref().unwrap();
-                    let g = self.dequant(exec, &p[base], &p[base + 1], &p[base + 2], &x1ns[i], h, moe_inter)?;
-                    let u = self.dequant(exec, &p[base + 3], &p[base + 4], &p[base + 5], &x1ns[i], h, moe_inter)?;
-                    let sg = self.swiglu(exec, &g, &u, moe_inter)?;
-                    let y = self.dequant(exec, &p[base + 6], &p[base + 7], &p[base + 8], &sg, moe_inter, h)?;
-                    self.scaled_add(exec, &x1s[i], &y, wts[rank], h)?;
+                    let ge = self.matmul_raw(exec, &p[base], &p[base + 1], &p[base + 2], &xe, n_e, h, moe_inter)?;
+                    let ue = self.matmul_raw(exec, &p[base + 3], &p[base + 4], &p[base + 5], &xe, n_e, h, moe_inter)?;
+                    let sge = self.swiglu(exec, &ge, &ue, n_e as u32 * moe_inter)?;
+                    let ye = self.matmul_raw(exec, &p[base + 6], &p[base + 7], &p[base + 8], &sge, n_e, moe_inter, h)?;
+                    ye_of.insert(e, ye);
+                }
+                // scatter in per-token rank order (bit-exact accumulation order)
+                for i in 0..t {
+                    let (ids, wts) = &per_tok[i];
+                    for (rank, &e) in ids.iter().enumerate() {
+                        let row = row_of[&(e, i)];
+                        self.scaled_add_off(exec, &x1s[i], &ye_of[&e], (row * hs * 2) as u64, wts[rank], h)?;
+                    }
+                }
+            } else {
+                // Phase 1: per-token expert matvec from the resident pool.
+                for i in 0..t {
+                    let (ids, wts) = &per_tok[i];
+                    for (rank, &e) in ids.iter().enumerate() {
+                        let base = slot_of[&e] * 9;
+                        let p = self.batch_pool.as_ref().unwrap();
+                        let g = self.dequant(exec, &p[base], &p[base + 1], &p[base + 2], &x1ns[i], h, moe_inter)?;
+                        let u = self.dequant(exec, &p[base + 3], &p[base + 4], &p[base + 5], &x1ns[i], h, moe_inter)?;
+                        let sg = self.swiglu(exec, &g, &u, moe_inter)?;
+                        let y = self.dequant(exec, &p[base + 6], &p[base + 7], &p[base + 8], &sg, moe_inter, h)?;
+                        self.scaled_add(exec, &x1s[i], &y, wts[rank], h)?;
+                    }
                 }
             }
             xs = x1s;
@@ -267,6 +308,34 @@ impl Model {
                   &p as *const _ as *const c_void, std::mem::size_of::<DequantParams>(), out_f as u64)?;
         Ok(out)
     }
+    /// BATCHED 4-bit dequant matmul: Y[T,out] = Xc[T,in] @ dequant(w,s,b).
+    /// One dispatch, T*out threads -> GPU saturation vs per-token matvec.
+    fn matmul_raw(&self, exec: &ObsidianExecutor, w: &Buffer, s: &Buffer, b: &Buffer,
+                  xc: &Buffer, t: usize, in_f: u32, out_f: u32) -> Result<Buffer, String> {
+        let out = self.buf(exec, t * out_f as usize * 2);
+        let p = MatmulParams { in_features: in_f, out_features: out_f, group_size: 64, n_tokens: t as u32 };
+        let total = (t * out_f as usize) as u64;
+        self.disp(exec, "matmul_dequant_4bit", &[w, s, b, xc, &out],
+                  &p as *const _ as *const c_void, std::mem::size_of::<MatmulParams>(), total)?;
+        Ok(out)
+    }
+    /// scaled_add reading the source `y` at a byte offset (one row of a [N,n]
+    /// batched buffer): acc += scale * y[off..off+n].
+    fn scaled_add_off(&self, exec: &ObsidianExecutor, acc: &Buffer, y: &Buffer, y_off: u64, scale: f32, n: u32) -> Result<(), String> {
+        let p = ScaledN { n, scale };
+        let pso = exec.pipeline("ew_scaled_add").ok_or("ew_scaled_add")?;
+        let cb = exec.queue().new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pso);
+        enc.set_buffer(0, Some(acc), 0);
+        enc.set_buffer(1, Some(y), y_off);
+        enc.set_bytes(2, std::mem::size_of::<ScaledN>() as u64, &p as *const _ as *const c_void);
+        enc.dispatch_thread_groups(MTLSize::new((n as u64 + 255) / 256, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        Ok(())
+    }
+
     fn dequant_named(&self, exec: &ObsidianExecutor, name: &str, x: &Buffer, in_f: u32, out_f: u32) -> Result<Buffer, String> {
         let w = self.weights.get(&format!("{name}.weight")).ok_or(format!("missing {name}.weight"))?.clone();
         let s = self.weights.get(&format!("{name}.scales")).ok_or(format!("missing {name}.scales"))?.clone();

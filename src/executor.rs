@@ -8,7 +8,7 @@
 use metal::{CompileOptions, ComputePipelineState, Device, Library};
 use std::collections::HashMap;
 
-const SHADERS: [(&str, &str); 12] = [
+const SHADERS: [(&str, &str); 13] = [
     ("fused_dequant_matvec_4bit",
         include_str!("../shaders/fused_dequant_matvec_4bit.metal")),
     ("moe_routing_topk",
@@ -28,6 +28,7 @@ const SHADERS: [(&str, &str); 12] = [
     ("ew_scaled_add", include_str!("../shaders/ops.metal")),
     ("kv_append", include_str!("../shaders/ops.metal")),
     ("dequant_matvec_8bit", include_str!("../shaders/dequant_matvec_8bit.metal")),
+    ("matmul_dequant_4bit", include_str!("../shaders/matmul_dequant_4bit.metal")),
 ];
 
 pub struct ObsidianExecutor {
