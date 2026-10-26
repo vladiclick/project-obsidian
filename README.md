@@ -52,6 +52,14 @@ Any OpenAI-compatible client works with `OPENAI_BASE_URL=http://localhost:8000/v
 
 Other flags: `--expert-dir` (default `<model_dir>/splitted_moe`), `--max-tokens` (default 50), `--port` (default 8000).
 
+Environment variables (all optional):
+
+| Variable | Effect |
+|---|---|
+| `OBSIDIAN_MAX_LEN` | KV-cache context length in tokens (default 16384, about 1.6 GB) |
+| `OBSIDIAN_NO_GEMM` | Set to use the per-token mat-vec expert path instead of the grouped GEMM |
+| `OBSIDIAN_NO_BATCH` | Set to disable batched prefill |
+
 ## Validation scripts
 
 - `validate_dequant.py` — replicates the shader's 4-bit unpacking in NumPy and compares it with `mx.dequantize` on a real weight.
