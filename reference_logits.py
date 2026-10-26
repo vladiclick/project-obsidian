@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """Ground-truth next-token for input id 9707 via the validated AirLLM Python
 MoE engine (layer-streamed, fits 16GB, q/k-norm + proper RoPE). Compare its
-argmax/top-5 against Obsidian's output."""
-import sys
-sys.path.insert(0, "/Users/vladi/Desktop/macairllm/airllm/air_llm")
+argmax/top-5 against Obsidian's output.
+Set AIRLLM_PATH to the air_llm directory of a local AirLLM checkout."""
+import os, sys
+sys.path.insert(0, os.environ.get("AIRLLM_PATH", "airllm/air_llm"))
 import mlx.core as mx
 import mlx.nn as nn
 from airllm.airllm_qwen3_moe import AirLLMQwen3Moe

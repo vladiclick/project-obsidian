@@ -1,3 +1,5 @@
+> Historical notes from the first build attempt (June 2026), kept for reference. The build issues listed here were resolved; see the README for current instructions.
+
 # Project Obsidian — Build Status (Phase 1)
 
 ## Structure created

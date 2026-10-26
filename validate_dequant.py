@@ -3,12 +3,12 @@
 Compares a numpy replica of the Metal fused_dequant_matvec_4bit unpacking
 against MLX's own mx.dequantize on a REAL Qwen3 weight. No full-model load.
 """
-import glob, json, sys
+import glob, json, os, sys
 import mlx.core as mx
 import numpy as np
 
-SNAP = glob.glob("/Users/vladi/.cache/huggingface/hub/"
-                 "models--mlx-community--Qwen3-30B-A3B-Instruct-2507-4bit/snapshots/*")[0]
+HUB = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+SNAP = glob.glob(f"{HUB}/models--mlx-community--Qwen3-30B-A3B-Instruct-2507-4bit/snapshots/*")[0]
 KEY = "model.layers.0.self_attn.q_proj.weight"
 
 idx = json.load(open(f"{SNAP}/model.safetensors.index.json"))["weight_map"]
