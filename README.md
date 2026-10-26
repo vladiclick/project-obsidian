@@ -52,7 +52,7 @@ Any OpenAI-compatible client works with `OPENAI_BASE_URL=http://localhost:8000/v
 
 Other flags: `--expert-dir` (default `<model_dir>/splitted_moe`), `--max-tokens` (default 50), `--port` (default 8000).
 
-Environment variables (all optional):
+Environment variables (all optional; a template is in [`.env.example`](.env.example)):
 
 | Variable | Effect |
 |---|---|
