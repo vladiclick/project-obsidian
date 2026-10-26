@@ -8,15 +8,11 @@
 use metal::{CompileOptions, ComputePipelineState, Device, Library};
 use std::collections::HashMap;
 
-const SHADERS: [(&str, &str); 13] = [
+const SHADERS: &[(&str, &str)] = &[
     ("fused_dequant_matvec_4bit",
         include_str!("../shaders/fused_dequant_matvec_4bit.metal")),
     ("moe_routing_topk",
         include_str!("../shaders/moe_routing_topk.metal")),
-    ("fused_moe_combine",
-        include_str!("../shaders/fused_moe_combine.metal")),
-    ("fused_residual_rms_norm",
-        include_str!("../shaders/fused_residual_rms_norm.metal")),
     ("rope_apply",
         include_str!("../shaders/rope.metal")),
     ("sdpa_decode",
@@ -45,7 +41,7 @@ impl ObsidianExecutor {
         let queue = device.new_command_queue();
 
         let mut pipelines = HashMap::new();
-        for (name, src) in SHADERS {
+        for &(name, src) in SHADERS {
             let opts = CompileOptions::new();
             let lib: Library = device.new_library_with_source(src, &opts)?;
             let func = lib.get_function(name, None)?;

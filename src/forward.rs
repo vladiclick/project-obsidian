@@ -461,11 +461,6 @@ impl Model {
         self.f16_buf(exec, &row)
     }
 
-    pub fn reset_cache(&mut self) {
-        for c in &mut self.caches { c.seq_len = 0; }
-        self.last_seq.clear();
-    }
-
     /// Run one agentic turn with cross-request PREFIX REUSE.
     /// The KV cache persists across calls; we reuse the K/V of the longest
     /// common prefix between this prompt and what's already cached (exact:

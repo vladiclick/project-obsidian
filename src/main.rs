@@ -44,13 +44,15 @@ fn main() {
     log::info!("Project Obsidian Phase 1 skeleton. model={}", args.model);
     let _ = (&args.prompt, args.max_tokens, args.benchmark);
 
-    // Phase 1 self-test: init Metal device + runtime-compile all 4 .metal kernels.
+    // Phase 1 self-test: init Metal device + runtime-compile all kernels.
     match executor::ObsidianExecutor::new() {
         Ok(exec) => {
             println!("[obsidian] OK: Metal device '{}' up.", exec.device().name());
-            for k in ["fused_dequant_matvec_4bit", "moe_routing_topk",
-                      "fused_moe_combine", "fused_residual_rms_norm",
-                      "rope_apply", "sdpa_decode"] {
+            let kernels = vec![
+                "fused_dequant_matvec_4bit", "moe_routing_topk",
+                "rope_apply", "sdpa_decode"
+            ];
+            for k in kernels {
                 let ok = exec.pipeline(k).is_some();
                 println!("[obsidian]   kernel {k}: {}", if ok { "compiled ✓" } else { "MISSING" });
             }
