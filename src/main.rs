@@ -122,7 +122,6 @@ fn main() {
 }
 
 fn serve(args: &Args) {
-    use std::io::Read;
     let exec = executor::ObsidianExecutor::new().expect("metal");
     let model_dir = std::path::Path::new(&args.config).parent().expect("--config").to_path_buf();
     let expert_dir = if args.expert_dir.is_empty() { model_dir.join("splitted_moe") }
