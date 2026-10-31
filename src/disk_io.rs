@@ -90,7 +90,7 @@ pub fn read_experts_parallel(
     }).collect();
 
     reqs.par_iter().filter_map(|r| {
-        let aligned = ((r.len + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+        let aligned = r.len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
         let mut buf: Vec<u8> = Vec::with_capacity(aligned);
         unsafe {
             let n = libc::pread(r.fd, buf.as_mut_ptr() as *mut libc::c_void, r.len, r.offset as i64);

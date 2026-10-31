@@ -294,7 +294,7 @@ impl Model {
         enc.set_compute_pipeline_state(pso);
         for (i, b) in bufs.iter().enumerate() { enc.set_buffer(i as u64, Some(*b), 0); }
         enc.set_bytes(bufs.len() as u64, plen as u64, params);
-        enc.dispatch_thread_groups(MTLSize::new((n + 255) / 256, 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
         cb.commit();
         Ok(())
@@ -330,7 +330,7 @@ impl Model {
         enc.set_buffer(0, Some(acc), 0);
         enc.set_buffer(1, Some(y), y_off);
         enc.set_bytes(2, std::mem::size_of::<ScaledN>() as u64, &p as *const _ as *const c_void);
-        enc.dispatch_thread_groups(MTLSize::new((n as u64 + 255) / 256, 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_thread_groups(MTLSize::new((n as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
         cb.commit();
         Ok(())
