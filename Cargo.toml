@@ -1,6 +1,9 @@
 [package]
 name = "obsidian"
 version = "0.1.0"
+description = "Rust + Metal inference engine that runs Qwen3-30B-A3B on a 16 GB Apple Silicon Mac by streaming experts from SSD."
+license = "MIT"
+repository = "https://github.com/vladiclick/project-obsidian"
 # edition 2024 needs rustc >= 1.85; we have 1.96, but 2021 is fine and portable.
 edition = "2021"
 
