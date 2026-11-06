@@ -102,7 +102,18 @@ pub fn read_experts_parallel(
 }
 
 #[derive(Debug)]
-pub enum ObsidianError { Io(String), Parse(String), Metal(String) }
+pub enum ObsidianError { Io(String), Parse(String) }
+
+impl std::fmt::Display for ObsidianError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ObsidianError::Io(m) => write!(f, "I/O error: {m}"),
+            ObsidianError::Parse(m) => write!(f, "parse error: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for ObsidianError {}
 
 impl From<std::io::Error> for ObsidianError {
     fn from(e: std::io::Error) -> Self { ObsidianError::Io(e.to_string()) }

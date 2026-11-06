@@ -55,8 +55,8 @@ pub struct Model {
 impl Model {
     pub fn new(model_dir: &Path, expert_dir: &Path, exec: &ObsidianExecutor) -> Result<Self, String> {
         let cfg = Qwen3MoeConfig::from_file(&model_dir.join("config.json"))?;
-        let weights = Weights::load_non_expert(model_dir, exec.device()).map_err(|e| format!("{e:?}"))?;
-        let experts = ExpertIndex::open(expert_dir, cfg.num_hidden_layers).map_err(|e| format!("{e:?}"))?;
+        let weights = Weights::load_non_expert(model_dir, exec.device()).map_err(|e| format!("{e}"))?;
+        let experts = ExpertIndex::open(expert_dir, cfg.num_hidden_layers).map_err(|e| format!("{e}"))?;
         // KV context window. Coding sessions need far more than the old 4096;
         // 16384 fits comfortably in 16GB (n_kv 4 * 16384 * head_dim 128 * 2B *
         // 2(k,v) * 48 layers ≈ 1.6GB). Override with OBSIDIAN_MAX_LEN.
