@@ -64,7 +64,7 @@ impl Model {
             .and_then(|s| s.parse::<usize>().ok()).unwrap_or(16384);
         let attn = Attention {
             n_heads: cfg.num_attention_heads as u32, n_kv: cfg.num_key_value_heads as u32,
-            head_dim: cfg.head_dim() as u32, theta: cfg.rope_theta,
+            head_dim: cfg.head_dim() as u32,
             // device score scratch [n_heads * max_len] f32, allocated once
             scratch: exec.device().new_buffer(
                 (cfg.num_attention_heads * max_len * 4) as u64, SHARED),

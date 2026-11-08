@@ -13,7 +13,6 @@ pub struct Attention {
     pub n_heads: u32,
     pub n_kv: u32,
     pub head_dim: u32,
-    pub theta: f32,
     /// device score scratch [n_heads * max_len] f32, allocated once + reused.
     pub scratch: Buffer,
 }

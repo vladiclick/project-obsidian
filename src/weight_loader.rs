@@ -13,7 +13,6 @@ use std::path::Path;
 
 pub struct Weights {
     pub tensors: HashMap<String, Buffer>,
-    pub shapes: HashMap<String, Vec<usize>>,
 }
 
 impl Weights {
@@ -31,7 +30,6 @@ impl Weights {
         };
 
         let mut tensors = HashMap::new();
-        let mut shapes = HashMap::new();
         let opt = MTLResourceOptions::StorageModeShared;
 
         for sf in &shards {
@@ -66,11 +64,10 @@ impl Weights {
                         data.as_ptr(), buf.contents() as *mut u8, data.len());
                 }
                 tensors.insert(name.to_string(), buf);
-                shapes.insert(name.to_string(), view.shape().to_vec());
             }
         }
         log::info!("loaded {} non-expert tensors", tensors.len());
-        Ok(Self { tensors, shapes })
+        Ok(Self { tensors })
     }
 
     pub fn get(&self, name: &str) -> Option<&Buffer> {
