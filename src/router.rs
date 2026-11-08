@@ -1,8 +1,7 @@
-// router.rs — MoE routing (GPU top-k) + expert paging trigger.
-// Dispatches moe_routing_topk, reads the selected expert ids back, then fires
-// disk_io::read_experts_parallel to page only those experts off SSD.
+// router.rs — MoE routing (GPU top-k).
+// Dispatches moe_routing_topk and reads the selected expert ids back; forward.rs
+// then pages only those experts off SSD with disk_io::read_experts_parallel.
 
-use crate::disk_io::{read_experts_parallel, ExpertIndex, RawTensor};
 use crate::executor::ObsidianExecutor;
 use metal::{Buffer, MTLResourceOptions, MTLSize};
 
@@ -92,17 +91,5 @@ impl MoeRouter {
         let wts: Vec<f32> = (0..self.top_k as isize)
             .map(|i| half::f16::from_bits(unsafe { *wp.offset(i) }).to_f32()).collect();
         (ids, wts)
-    }
-
-    /// Full step: route, then page the selected experts off disk.
-    pub fn route_and_page(
-        &self,
-        exec: &ObsidianExecutor,
-        gate_logits: &Buffer,
-        index: &ExpertIndex,
-        layer: usize,
-    ) -> Result<Vec<RawTensor>, String> {
-        let (ids, _wts) = self.route(exec, gate_logits)?;
-        Ok(read_experts_parallel(index, layer, &ids))
     }
 }
